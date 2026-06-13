@@ -134,11 +134,14 @@ class ChatWindow(tk.Toplevel):
         self.geometry("400x500")
         self.transient(parent)
 
+        self._last_msg_key = set()
+
         self._create_widgets()
         self._load_history()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.chat_manager.register_callback("message_received", self._on_message_received)
+        self.chat_manager.register_callback("message_sent", self._on_message_sent)
 
     def _create_widgets(self):
         main_frame = ttk.Frame(self, padding="10")
@@ -186,7 +189,21 @@ class ChatWindow(tk.Toplevel):
         if msg.from_ip == self.peer_ip:
             self.after(0, lambda: self._add_message(msg))
 
+    def _on_message_sent(self, msg):
+        if msg.to_ip == self.peer_ip:
+            self.after(0, lambda: self._add_message(msg))
+
+    def _msg_key(self, msg):
+        return (msg.from_ip, msg.to_ip, msg.content, msg.timestamp, msg.from_me)
+
     def _add_message(self, msg):
+        key = self._msg_key(msg)
+        if key in self._last_msg_key:
+            return
+        self._last_msg_key.add(key)
+        if len(self._last_msg_key) > 200:
+            self._last_msg_key.clear()
+
         self.messages_text.config(state=tk.NORMAL)
 
         time_str = datetime.fromtimestamp(msg.timestamp).strftime("%H:%M:%S")
@@ -215,16 +232,13 @@ class ChatWindow(tk.Toplevel):
 
         if self.chat_manager.send_message(self.peer_ip, content):
             self.input_text.delete("1.0", tk.END)
-            msg = ChatMessage(
-                from_ip="",
-                to_ip=self.peer_ip,
-                content=content,
-                from_me=True,
-                sender_name=HOSTNAME,
-            )
-            self._add_message(msg)
 
     def _on_close(self):
+        try:
+            self.chat_manager.unregister_callback("message_received", self._on_message_received)
+            self.chat_manager.unregister_callback("message_sent", self._on_message_sent)
+        except Exception:
+            pass
         self.destroy()
 
 
@@ -260,6 +274,8 @@ class MainWindow:
         self.folder_transfer = FolderTransfer(self.file_transfer)
         self.chat_manager = ChatManager(self.connection)
         self.history_manager = HistoryManager()
+        self._transfer_items: dict = {}
+        self._chat_windows: dict = {}
 
     def _setup_styles(self):
         style = ttk.Style()
@@ -821,7 +837,26 @@ class MainWindow:
             self._open_chat(device)
 
     def _open_chat(self, device):
-        chat_window = ChatWindow(self.root, device.ip, device.hostname, self.chat_manager)
+        peer_ip = device.ip
+        if peer_ip in self._chat_windows:
+            existing = self._chat_windows[peer_ip]
+            try:
+                if existing.winfo_exists():
+                    existing.lift()
+                    existing.focus_force()
+                    return
+            except Exception:
+                pass
+            del self._chat_windows[peer_ip]
+
+        chat_window = ChatWindow(self.root, peer_ip, device.hostname, self.chat_manager)
+        self._chat_windows[peer_ip] = chat_window
+
+        def on_window_destroy(event):
+            if peer_ip in self._chat_windows and self._chat_windows[peer_ip] is chat_window:
+                del self._chat_windows[peer_ip]
+
+        chat_window.bind("<Destroy>", on_window_destroy)
 
     def _on_file_request(self, ip, msg):
         file_id = msg.get("file_id")
@@ -892,9 +927,11 @@ class MainWindow:
         direction = "↑" if task.direction == "send" else "↓"
         status_text = self._get_status_text(task.status)
 
+        display_name = getattr(task, "_display_name", task.file_name)
+
         values = (
             direction,
-            task.file_name,
+            display_name,
             peer_name or task.target_ip,
             format_file_size(task.file_size),
             f"{task.get_progress():.1f}%",
@@ -905,10 +942,11 @@ class MainWindow:
         existing = self._find_transfer_item(task.file_id)
         if existing:
             self.transfers_tree.item(existing, values=values)
+            self._set_row_color(existing, task.status)
             return
 
         item = self.transfers_tree.insert("", tk.END, values=values, tags=(task.status,))
-        self.transfers_tree.set(item, "file_id", task.file_id)
+        self._transfer_items[task.file_id] = item
 
         self._set_row_color(item, task.status)
 
@@ -923,8 +961,11 @@ class MainWindow:
         direction = "↑" if task.direction == "send" else "↓"
         status_text = self._get_status_text(task.status)
 
+        display_name = getattr(task, "_display_name", task.file_name)
+
         values = list(self.transfers_tree.item(item, "values"))
         values[0] = direction
+        values[1] = display_name
         values[4] = f"{task.get_progress():.1f}%"
         values[5] = format_speed(task.speed)
         values[6] = status_text
@@ -933,13 +974,7 @@ class MainWindow:
         self._set_row_color(item, task.status)
 
     def _find_transfer_item(self, file_id):
-        for item in self.transfers_tree.get_children():
-            try:
-                if self.transfers_tree.set(item, "file_id") == file_id:
-                    return item
-            except Exception:
-                pass
-        return None
+        return self._transfer_items.get(file_id)
 
     def _get_status_text(self, status):
         status_map = {
@@ -966,12 +1001,13 @@ class MainWindow:
 
     def _cancel_selected_transfers(self):
         for item in self.transfers_tree.selection():
-            try:
-                file_id = self.transfers_tree.set(item, "file_id")
-                if file_id:
-                    self.file_transfer.cancel_task(file_id)
-            except Exception:
-                pass
+            file_id = None
+            for fid, itm in self._transfer_items.items():
+                if itm == item:
+                    file_id = fid
+                    break
+            if file_id:
+                self.file_transfer.cancel_task(file_id)
 
     def _clear_completed_transfers(self):
         to_remove = []
@@ -981,6 +1017,13 @@ class MainWindow:
                 to_remove.append(item)
 
         for item in to_remove:
+            file_id = None
+            for fid, itm in list(self._transfer_items.items()):
+                if itm == item:
+                    file_id = fid
+                    break
+            if file_id:
+                del self._transfer_items[file_id]
             self.transfers_tree.delete(item)
 
         self.file_transfer.cleanup_completed_tasks()

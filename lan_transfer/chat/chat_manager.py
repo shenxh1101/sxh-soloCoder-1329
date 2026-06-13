@@ -47,11 +47,16 @@ class ChatManager:
         self.conn_manager.register_callback("chat_message", self._handle_chat_message)
 
     def register_callback(self, event: str, callback: Callable):
-        if event in self.callbacks:
+        if event in self.callbacks and callback not in self.callbacks[event]:
             self.callbacks[event].append(callback)
 
+    def unregister_callback(self, event: str, callback: Callable):
+        if event in self.callbacks and callback in self.callbacks[event]:
+            self.callbacks[event].remove(callback)
+
     def _trigger_event(self, event: str, *args, **kwargs):
-        for callback in self.callbacks.get(event, []):
+        callbacks_copy = list(self.callbacks.get(event, []))
+        for callback in callbacks_copy:
             try:
                 callback(*args, **kwargs)
             except Exception as e:

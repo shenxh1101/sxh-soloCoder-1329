@@ -21,7 +21,7 @@ from lan_transfer.config import (
     STATUS_FAILED,
     STATUS_CANCELLED,
 )
-from lan_transfer.utils import generate_file_id, get_md5
+from lan_transfer.utils import generate_file_id, get_md5, format_file_size
 from lan_transfer.network.connection import ConnectionManager
 
 
@@ -85,6 +85,7 @@ class FileTransfer:
         self.tasks: Dict[str, TransferTask] = {}
         self.pending_requests: Dict[str, dict] = {}
         self.connection_keys: Dict[str, str] = {}
+        self._resume_index: Dict[str, str] = {}
         self.callbacks = {
             "task_started": [],
             "task_progress": [],
@@ -95,6 +96,75 @@ class FileTransfer:
         self._lock = threading.Lock()
 
         self.conn_manager.register_callback("file_request", self._handle_file_message)
+        self._load_resume_index()
+
+    def _resume_meta_path(self, temp_file: str) -> str:
+        return temp_file + ".meta"
+
+    def _load_resume_index(self):
+        self._resume_index.clear()
+        try:
+            for fname in os.listdir(TEMP_DIR):
+                if fname.endswith(".meta"):
+                    meta_path = os.path.join(TEMP_DIR, fname)
+                    try:
+                        with open(meta_path, "r", encoding="utf-8") as f:
+                            meta = json.load(f)
+                        md5 = meta.get("file_md5", "")
+                        size = meta.get("file_size", 0)
+                        temp_file = meta.get("temp_file", "")
+                        if md5 and size and temp_file and os.path.exists(temp_file):
+                            key = f"{md5}_{size}"
+                            self._resume_index[key] = temp_file
+                    except Exception:
+                        try:
+                            os.remove(meta_path)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    def _save_resume_meta(self, temp_file: str, file_md5: str, file_size: int, file_name: str):
+        meta = {
+            "file_md5": file_md5,
+            "file_size": file_size,
+            "file_name": file_name,
+            "temp_file": temp_file,
+            "created_at": time.time(),
+        }
+        meta_path = self._resume_meta_path(temp_file)
+        try:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+            key = f"{file_md5}_{file_size}"
+            self._resume_index[key] = temp_file
+        except Exception:
+            pass
+
+    def _remove_resume_meta(self, temp_file: str):
+        meta_path = self._resume_meta_path(temp_file)
+        try:
+            if os.path.exists(meta_path):
+                os.remove(meta_path)
+        except Exception:
+            pass
+
+    def _find_resumable_temp(self, file_md5: str, file_size: int) -> Optional[str]:
+        key = f"{file_md5}_{file_size}"
+        temp_file = self._resume_index.get(key)
+        if temp_file and os.path.exists(temp_file):
+            size = os.path.getsize(temp_file)
+            if 0 < size < file_size:
+                return temp_file
+            elif size >= file_size:
+                self._remove_resume_meta(temp_file)
+                try:
+                    os.remove(temp_file)
+                except Exception:
+                    pass
+                if key in self._resume_index:
+                    del self._resume_index[key]
+        return None
 
     def register_callback(self, event: str, callback: Callable):
         if event in self.callbacks:
@@ -181,18 +251,71 @@ class FileTransfer:
         if connection_key:
             self.connection_keys[file_id] = connection_key
 
-        temp_file = os.path.join(TEMP_DIR, f"{file_id}.part")
-        existing_size = os.path.getsize(temp_file) if os.path.exists(temp_file) else 0
+        new_temp_file = os.path.join(TEMP_DIR, f"{file_id}.part")
+        existing_size = 0
+
+        old_temp_file = self._find_resumable_temp(file_md5, file_size)
+        if old_temp_file:
+            try:
+                import shutil
+                if os.path.exists(old_temp_file):
+                    existing_size = os.path.getsize(old_temp_file)
+                    if 0 < existing_size < file_size:
+                        old_meta = self._resume_meta_path(old_temp_file)
+                        shutil.move(old_temp_file, new_temp_file)
+                        new_meta = self._resume_meta_path(new_temp_file)
+                        if os.path.exists(old_meta):
+                            if os.path.exists(new_meta):
+                                os.remove(new_meta)
+                            shutil.move(old_meta, new_meta)
+                        key = f"{file_md5}_{file_size}"
+                        self._resume_index[key] = new_temp_file
+            except Exception as e:
+                print(f"续传准备失败: {e}")
+                existing_size = 0
+
+        if existing_size <= 0 and os.path.exists(new_temp_file):
+            existing_size = os.path.getsize(new_temp_file)
 
         if existing_size > 0 and existing_size < file_size:
-            resume_msg = {
-                "type": MSG_TYPE_RESUME_REQUEST,
+            task = TransferTask(
+                file_id=file_id,
+                file_path=os.path.join(DOWNLOAD_DIR, file_name),
+                file_name=file_name,
+                file_size=file_size,
+                target_ip=ip,
+                direction="receive",
+            )
+            task.md5 = file_md5
+            task.transferred = existing_size
+
+            with self._lock:
+                self.tasks[file_id] = task
+
+            resume_msg_copy = {
+                "type": MSG_TYPE_FILE_REQUEST,
+                "file_id": file_id,
+                "file_name": file_name + f" (续传 {format_file_size(existing_size)} 已完成)",
+                "original_name": file_name,
+                "file_size": file_size,
+                "file_md5": file_md5,
+                "is_resume": True,
+                "existing_size": existing_size,
+            }
+
+            self.pending_requests[file_id] = {
+                "ip": ip,
                 "file_id": file_id,
                 "file_name": file_name,
                 "file_size": file_size,
+                "file_md5": file_md5,
+                "task": task,
+                "connection_key": connection_key,
+                "resume": True,
                 "existing_size": existing_size,
             }
-            self.conn_manager.send_file_message(ip, resume_msg)
+
+            self._trigger_event("file_request", ip, resume_msg_copy)
             return
 
         task = TransferTask(
@@ -229,22 +352,34 @@ class FileTransfer:
         task.status = STATUS_TRANSFERRING
         task.start_time = time.time()
 
+        is_resume = req.get("resume", False)
+        existing_size = req.get("existing_size", 0)
+
         connection_key = req.get("connection_key")
         conn = None
         if connection_key:
             conn = self.conn_manager.get_receive_connection(connection_key)
             self.conn_manager._trigger_event("start_receiving")
 
-        response_msg = {
-            "type": MSG_TYPE_FILE_RESPONSE,
-            "file_id": file_id,
-            "accepted": True,
-        }
+        if is_resume:
+            response_msg = {
+                "type": MSG_TYPE_RESUME_RESPONSE,
+                "file_id": file_id,
+                "can_resume": True,
+                "resume_offset": existing_size,
+            }
+        else:
+            response_msg = {
+                "type": MSG_TYPE_FILE_RESPONSE,
+                "file_id": file_id,
+                "accepted": True,
+            }
 
         if self.conn_manager.send_file_message(req["ip"], response_msg):
+            start_offset = existing_size if is_resume else 0
             threading.Thread(
                 target=self._receive_file,
-                args=(task, req["ip"], 0, conn, connection_key),
+                args=(task, req["ip"], start_offset, conn, connection_key),
                 daemon=True,
             ).start()
             self._trigger_event("task_started", task)
@@ -259,6 +394,22 @@ class FileTransfer:
         req = self.pending_requests[file_id]
         task = req["task"]
         task.status = STATUS_REJECTED
+
+        is_resume = req.get("resume", False)
+        file_md5 = req.get("file_md5")
+        file_size = req.get("file_size")
+
+        temp_file = os.path.join(TEMP_DIR, f"{file_id}.part")
+        if is_resume and os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+                self._remove_resume_meta(temp_file)
+            except Exception:
+                pass
+            if file_md5 and file_size:
+                key = f"{file_md5}_{file_size}"
+                if key in self._resume_index:
+                    del self._resume_index[key]
 
         response_msg = {
             "type": MSG_TYPE_FILE_RESPONSE,
@@ -340,44 +491,25 @@ class FileTransfer:
         can_resume = msg.get("can_resume", False)
         resume_offset = msg.get("resume_offset", 0)
 
-        if file_id not in self.pending_requests:
+        with self._lock:
+            task = self.tasks.get(file_id)
+
+        if not task or task.direction != "send":
             return
 
-        req = self.pending_requests[file_id]
-        task = req["task"]
-
-        connection_key = req.get("connection_key")
-        conn = None
-        if connection_key:
-            conn = self.conn_manager.get_receive_connection(connection_key)
-            self.conn_manager._trigger_event("start_receiving")
-
         if not can_resume:
-            temp_file = os.path.join(TEMP_DIR, f"{file_id}.part")
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-            task.transferred = 0
+            resume_offset = 0
 
+        task.transferred = resume_offset
         task.status = STATUS_TRANSFERRING
         task.start_time = time.time()
-        task.transferred = resume_offset
-
-        response_msg = {
-            "type": MSG_TYPE_FILE_RESPONSE,
-            "file_id": file_id,
-            "accepted": True,
-            "resume": True,
-            "resume_offset": resume_offset,
-        }
-        self.conn_manager.send_file_message(ip, response_msg)
+        self._trigger_event("task_started", task)
 
         threading.Thread(
-            target=self._receive_file,
-            args=(task, ip, resume_offset, conn, connection_key),
+            target=self._send_file,
+            args=(task, ip, resume_offset),
             daemon=True,
         ).start()
-        self._trigger_event("task_started", task)
-        del self.pending_requests[file_id]
 
     def _send_file(self, task: TransferTask, target_ip: str, start_offset: int = 0):
         chunk_size = BUFFER_SIZE * 16
@@ -444,6 +576,9 @@ class FileTransfer:
         bytes_since_update = 0
 
         try:
+            if task.md5 and task.file_size:
+                self._save_resume_meta(temp_file, task.md5, task.file_size, task.file_name)
+
             mode = "ab" if start_offset > 0 else "wb"
             with open(temp_file, mode) as f:
                 task.transferred = start_offset
@@ -498,11 +633,16 @@ class FileTransfer:
             task.error = str(e)
             self._trigger_event("task_failed", task)
         finally:
-            if os.path.exists(temp_file) and task.status == STATUS_COMPLETED:
-                try:
-                    os.remove(temp_file)
-                except Exception:
-                    pass
+            if task.status == STATUS_COMPLETED:
+                self._remove_resume_meta(temp_file)
+                key = f"{task.md5}_{task.file_size}"
+                if key in self._resume_index:
+                    del self._resume_index[key]
+                if os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                    except Exception:
+                        pass
 
             if connection_key and conn is not None:
                 try:

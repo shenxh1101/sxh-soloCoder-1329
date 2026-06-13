@@ -10,6 +10,8 @@ from lan_transfer.config import (
     TEMP_DIR,
     STATUS_COMPLETED,
     STATUS_FAILED,
+    STATUS_PENDING,
+    STATUS_TRANSFERRING,
 )
 from lan_transfer.transfer.file_transfer import FileTransfer, TransferTask
 from lan_transfer.utils import generate_file_id
@@ -20,6 +22,7 @@ class FolderTransfer:
         self.file_transfer = file_transfer
         self.folder_tasks: dict = {}
         self._temp_files: dict = {}
+        self._file_id_map: dict = {}
         self.callbacks = {
             "folder_started": [],
             "folder_progress": [],
@@ -30,6 +33,7 @@ class FolderTransfer:
         self.file_transfer.register_callback("task_completed", self._on_file_completed)
         self.file_transfer.register_callback("task_failed", self._on_file_failed)
         self.file_transfer.register_callback("task_progress", self._on_file_progress)
+        self.file_transfer.register_callback("task_started", self._on_file_started)
 
     def register_callback(self, event: str, callback: Callable):
         if event in self.callbacks:
@@ -59,43 +63,31 @@ class FolderTransfer:
             print(f"压缩文件夹失败: {e}")
             return None
 
-        file_size = os.path.getsize(temp_zip_path)
-        file_id = generate_file_id()
+        inner_task = self.file_transfer.send_file(temp_zip_path, target_ip)
+        if not inner_task:
+            try:
+                if os.path.exists(temp_zip_path):
+                    os.remove(temp_zip_path)
+            except Exception:
+                pass
+            return None
 
-        task = TransferTask(
-            file_id=file_id,
-            file_path=temp_zip_path,
-            file_name=zip_filename,
-            file_size=file_size,
-            target_ip=target_ip,
-            direction="send",
-            is_compressed=True,
-            original_name=folder_name,
-        )
+        folder_file_id = generate_file_id()
+        inner_task.is_compressed = True
+        inner_task.original_name = folder_name
+        inner_task._display_name = folder_name
 
-        self._temp_files[file_id] = temp_zip_path
-        self.folder_tasks[file_id] = {
-            "task": task,
+        self._temp_files[inner_task.file_id] = temp_zip_path
+        self._file_id_map[inner_task.file_id] = inner_task.file_id
+        self.folder_tasks[inner_task.file_id] = {
             "temp_path": temp_zip_path,
             "is_folder": True,
             "original_name": folder_name,
         }
 
-        inner_task = self.file_transfer.send_file(temp_zip_path, target_ip)
-        if inner_task:
-            task.md5 = inner_task.md5
-            self._trigger_event("folder_started", task)
+        self._trigger_event("folder_started", inner_task)
 
-            def monitor():
-                while inner_task.status not in [STATUS_COMPLETED, STATUS_FAILED]:
-                    pass
-                self._cleanup_temp(file_id)
-
-            threading.Thread(target=monitor, daemon=True).start()
-            return task
-        else:
-            self._cleanup_temp(file_id)
-            return None
+        return inner_task
 
     def send_paths(self, paths: List[str], target_ip: str) -> List[TransferTask]:
         tasks = []
@@ -122,7 +114,6 @@ class FolderTransfer:
 
     def _zip_folder(self, folder_path: str, zip_path: str):
         folder_path = os.path.abspath(folder_path)
-        parent_dir = os.path.dirname(folder_path)
         folder_name = os.path.basename(folder_path)
 
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
@@ -136,16 +127,49 @@ class FolderTransfer:
 
     def _unzip_folder(self, zip_path: str, extract_to: str) -> str:
         with zipfile.ZipFile(zip_path, "r") as zipf:
-            first_item = zipf.namelist()[0] if zipf.namelist() else ""
-            folder_name = first_item.split("/")[0] if first_item else "extracted"
+            namelist = zipf.namelist()
+            if not namelist:
+                raise Exception("ZIP文件为空")
 
-            safe_folder_name = self._get_unique_name(extract_to, folder_name)
-            extract_path = os.path.join(extract_to, safe_folder_name)
-            os.makedirs(extract_path, exist_ok=True)
+            first_item = namelist[0]
+            inner_folder_name = first_item.split("/")[0] if "/" in first_item else ""
 
-            zipf.extractall(extract_to)
+            if inner_folder_name:
+                safe_name = self._get_unique_name(extract_to, inner_folder_name)
 
-        return extract_path
+                if safe_name == inner_folder_name:
+                    zipf.extractall(extract_to)
+                    return os.path.join(extract_to, inner_folder_name)
+                else:
+                    temp_extract_dir = tempfile.mkdtemp(dir=TEMP_DIR)
+                    try:
+                        zipf.extractall(temp_extract_dir)
+                        src_path = os.path.join(temp_extract_dir, inner_folder_name)
+                        dst_path = os.path.join(extract_to, safe_name)
+                        if os.path.exists(src_path):
+                            shutil.move(src_path, dst_path)
+                            return dst_path
+                        else:
+                            for item in namelist:
+                                item_path = os.path.join(temp_extract_dir, item)
+                                if os.path.isfile(item_path):
+                                    target_dir = os.path.dirname(
+                                        os.path.join(extract_to, safe_name, item)
+                                    )
+                                    os.makedirs(target_dir, exist_ok=True)
+                                    shutil.move(item_path, os.path.join(extract_to, safe_name, item))
+                            return os.path.join(extract_to, safe_name)
+                    finally:
+                        try:
+                            shutil.rmtree(temp_extract_dir)
+                        except Exception:
+                            pass
+            else:
+                safe_name = self._get_unique_name(extract_to, "extracted_folder")
+                dst_path = os.path.join(extract_to, safe_name)
+                os.makedirs(dst_path, exist_ok=True)
+                zipf.extractall(dst_path)
+                return dst_path
 
     def _get_unique_name(self, base_dir: str, name: str) -> str:
         if not os.path.exists(os.path.join(base_dir, name)):
@@ -159,15 +183,19 @@ class FolderTransfer:
                 return new_name
             counter += 1
 
+    def _on_file_started(self, task: TransferTask):
+        if task.file_id in self.folder_tasks:
+            self._trigger_event("folder_started", task)
+
     def _on_file_completed(self, task: TransferTask):
-        folder_task_info = self.folder_tasks.get(task.file_id)
-        if folder_task_info and task.direction == "receive":
-            if task.file_name.endswith(".zip"):
+        if task.file_id in self.folder_tasks:
+            if task.direction == "receive" and task.file_name.endswith(".zip"):
                 try:
                     extracted_path = self._unzip_folder(task.file_path, DOWNLOAD_DIR)
 
                     try:
-                        os.remove(task.file_path)
+                        if os.path.exists(task.file_path):
+                            os.remove(task.file_path)
                     except Exception:
                         pass
 
@@ -180,8 +208,7 @@ class FolderTransfer:
                     print(f"解压文件夹失败: {e}")
 
             self._trigger_event("folder_completed", task)
-            if task.file_id in self.folder_tasks:
-                del self.folder_tasks[task.file_id]
+            self._cleanup_temp(task.file_id)
 
     def _on_file_failed(self, task: TransferTask):
         if task.file_id in self.folder_tasks:
@@ -190,11 +217,7 @@ class FolderTransfer:
 
     def _on_file_progress(self, task: TransferTask):
         if task.file_id in self.folder_tasks:
-            folder_task = self.folder_tasks[task.file_id]["task"]
-            folder_task.transferred = task.transferred
-            folder_task.speed = task.speed
-            folder_task.status = task.status
-            self._trigger_event("folder_progress", folder_task)
+            self._trigger_event("folder_progress", task)
 
     def _cleanup_temp(self, file_id: str):
         if file_id in self._temp_files:
@@ -208,6 +231,9 @@ class FolderTransfer:
 
         if file_id in self.folder_tasks:
             del self.folder_tasks[file_id]
+
+        if file_id in self._file_id_map:
+            del self._file_id_map[file_id]
 
     def cleanup_all_temp(self):
         for file_id in list(self._temp_files.keys()):
